@@ -1,19 +1,36 @@
-import re
-import chardet
 import argparse
+import json
+import re
+import sys
+
+import chardet
+
+
+__version__ = "0.2.1"
+
+PORT_LINE_RE = re.compile(
+    r"^(?P<port>\d+)/(?P<protocol>tcp|udp|sctp)\s+"
+    r"(?P<state>\S+)\s+"
+    r"(?P<service>\S+)"
+    r"(?:\s+(?P<version>.*))?$"
+)
+HOST_LINE_RE = re.compile(
+    r"^Nmap scan report for (?P<target>.+?)(?: \((?P<ip>[^)]+)\))?$"
+)
 
 
 def detect_encoding(file_path):
     """Detecta el encoding del archivo para evitar errores de decodificación."""
     with open(file_path, "rb") as f:
         result = chardet.detect(f.read())
-    return result["encoding"]
+    return result.get("encoding") or "utf-8"
 
 
 def parse_nmap_output(file_path):
     """Parsea la salida de Nmap desde un archivo y extrae información clave."""
     result = {
         "host": None,
+        "ip": None,
         "state": None,
         "os": None,
         "ports": []
@@ -28,49 +45,94 @@ def parse_nmap_output(file_path):
 
     for line in lines:
         # Detectar el host escaneado
-        if "Nmap scan report for" in line:
-            result["host"] = line.split()[-1]
+        host_match = HOST_LINE_RE.match(line.strip())
+        if host_match:
+            result["host"] = host_match.group("target")
+            result["ip"] = host_match.group("ip")
+            continue
 
         # Detectar el estado del host
-        elif "Host is up" in line:
+        if "Host is up" in line:
             result["state"] = "up"
+            continue
+        if "Host seems down" in line:
+            result["state"] = "down"
+            continue
 
         # Detectar sistema operativo estimado
-        elif "OS details:" in line:
+        if "OS details:" in line:
             result["os"] = line.split("OS details:")[1].strip()
-        elif "|   OS: " in line and result["os"] is None:
+            continue
+        if "|   OS: " in line and result["os"] is None:
             result["os"] = line.split("|   OS: ")[1].strip()
+            continue
+        if "Running: " in line and result["os"] is None:
+            result["os"] = line.split("Running: ")[1].strip()
+            continue
+
         # Detectar puertos abiertos y servicios
-        elif re.match(r"\d+/tcp\s+open", line):
-            parts = line.split()
-            port = parts[0]
-            service = parts[2]
-            version = " ".join(parts[3:]) if len(parts) > 3 else "Desconocido"
-            result["ports"].append(f"{port} -> {service} ({version})")
+        port_match = PORT_LINE_RE.match(line.strip())
+        if port_match:
+            port_data = port_match.groupdict()
+            port_data["version"] = port_data["version"] or "Desconocido"
+            result["ports"].append(port_data)
 
     return result
 
 
+def value_or_unknown(value):
+    """Devuelve un texto legible cuando un campo no pudo detectarse."""
+    return value or "No detectado"
+
+
 def display_summary(result):
     """Muestra un resumen del escaneo de Nmap."""
-    print("\n🔍 **Resumen del escaneo**")
-    print(f"✅ Host: {result['host']}")
-    print(f"🖥  Estado: {result['state']}")
-    print(f"🛠  Sistema operativo estimado: {result['os']}")
+    print("\nResumen del escaneo")
+    print(f"Host: {value_or_unknown(result['host'])}")
+    print(f"IP: {value_or_unknown(result['ip'])}")
+    print(f"Estado: {value_or_unknown(result['state'])}")
+    print(f"Sistema operativo estimado: {value_or_unknown(result['os'])}")
 
     if result["ports"]:
-        print("\n📡 **Puertos y servicios detectados:**")
+        print("\nPuertos y servicios detectados:")
         for port_info in result["ports"]:
-            print(f"  - {port_info}")
+            endpoint = f"{port_info['port']}/{port_info['protocol']}"
+            print(
+                "  - "
+                f"{endpoint} {port_info['state']} -> "
+                f"{port_info['service']} ({port_info['version']})"
+            )
     else:
-        print("\n🚫 No se encontraron puertos abiertos.")
+        print("\nNo se encontraron puertos detectados.")
 
 
-if __name__ == "__main__":
+def main():
+    """Punto de entrada de la CLI."""
     parser = argparse.ArgumentParser(description="Analizador de salida Nmap")
     parser.add_argument("-a", "--archivo", required=True,
                         help="Archivo con la salida de Nmap")
+    parser.add_argument("--json", action="store_true",
+                        help="Muestra el resultado en formato JSON")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 
-    parsed_result = parse_nmap_output(args.archivo)
-    display_summary(parsed_result)
+    try:
+        parsed_result = parse_nmap_output(args.archivo)
+    except FileNotFoundError:
+        print(f"Error: no se encontro el archivo {args.archivo}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"Error al leer el archivo {args.archivo}: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(parsed_result, ensure_ascii=False, indent=2))
+    else:
+        display_summary(parsed_result)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
